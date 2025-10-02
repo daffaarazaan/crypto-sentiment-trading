@@ -62,20 +62,31 @@ def build_asset_pipeline(asset, sent_daily, start, end, split_date, thr, cost):
     if isinstance(px.columns, pd.MultiIndex):
         px.columns = ["_".join([str(x) for x in tup if x != ""]).strip() for tup in px.columns]
 
-    # Pick price column robustly
-    candidates = ["Close", "Adj Close", "close", "adjclose"]
-    price_col = None
-    for c in candidates:
-        if c in px.columns:
-         price_col = c
-         break
+    # --- Put this inside build_asset_pipeline, after flattening px.columns ---
+def find_price_col(columns):
+    # works for: "Close", "Adj Close", "close", "adjclose",
+    # and suffixed forms like "Close_BTC-USD", "Adj Close_ETH-USD"
+    cols = [str(c) for c in columns]
+    # 1) exact matches
+    for exact in ["Close", "Adj Close", "close", "adj close", "adjclose"]:
+        if exact in cols:
+            return exact
+    # 2) prefix matches (handles "Close_BTC-USD")
+    for c in cols:
+        cl = c.lower()
+        if cl.startswith("close") or cl.startswith("adj close") or cl.startswith("adjclose"):
+            return c
+    return None
 
-    if price_col is None:
-        st.error(f"⚠️ Could not find a price column for {asset}. Got columns: {px.columns.tolist()}")
-        return pd.DataFrame(), {}, []  # graceful exit
+price_col = find_price_col(px.columns)
+if price_col is None:
+    st.error(f"⚠️ Could not find a price column for {asset}. Got columns: {px.columns.tolist()}")
+    return pd.DataFrame(), {}, []  # graceful skip
 
-    price = px[price_col].squeeze()
-    price.name = "price"
+# Always convert to a Series
+price = px[price_col].squeeze()
+price.name = "price"
+
 
     # 2) Features
     px["ret"]   = price.pct_change()
