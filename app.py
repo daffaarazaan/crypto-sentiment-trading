@@ -164,29 +164,35 @@ def score_sentiment(df_news, clf, batch=64):
     return sent_daily
 
 # ------------------------- Load News -------------------------
-uploaded = st.file_uploader("Upload a news CSV with 'published_at' + 'headline' columns (optional).")
+def pick_col(cols, candidates):
+    """Helper: find the first matching column name from a list of candidates"""
+    cols_low = [c.lower() for c in cols]
+    for c in candidates:
+        if c.lower() in cols_low:
+            return cols[cols_low.index(c.lower())]
+    return None
+
+uploaded = st.file_uploader("Upload a news CSV with a datetime + headline column (optional).")
 if uploaded:
     df_news = pd.read_csv(uploaded)
-    if not all(col in df_news.columns for col in ["published_at","headline"]):
-        st.error("CSV must include 'published_at' and 'headline'.")
-        st.stop()
-    df_news["published_at"] = pd.to_datetime(df_news["published_at"], errors="coerce")
-    df_news = df_news.dropna(subset=["published_at","headline"]).head(int(max_rows))
 else:
     import kagglehub, glob, os
     path = kagglehub.dataset_download("oliviervha/crypto-news")
     csvs = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
-    df_news = pd.read_csv(csvs[0]).rename(columns={"title":"headline","time":"published_at"})
-    df_news["published_at"] = pd.to_datetime(df_news["published_at"], errors="coerce")
-    df_news = df_news.dropna(subset=["published_at","headline"]).head(int(max_rows))
+    df_news = pd.read_csv(csvs[0])
 
-st.write(f"Loaded {len(df_news)} news rows")
+# Try to detect date and headline columns
+cdate = pick_col(df_news.columns.tolist(), ["published_at","date","datetime","time","created_at","timestamp","pub_date"])
+ctext = pick_col(df_news.columns.tolist(), ["headline","title","text","news","content","summary"])
 
-clf = load_sentiment_model(model_name)
-with st.spinner("Scoring sentiment..."):
-    sent_daily = score_sentiment(df_news, clf)
+if not cdate or not ctext:
+    st.error("Could not find a valid datetime and headline/text column in the news dataset.")
+    st.stop()
 
-st.write(f"Daily sentiment entries: {len(sent_daily)}")
+# Rename for consistency
+df_news = df_news[[cdate, ctext]].rename(columns={cdate:"published_at", ctext:"headline"})
+df_news["published_at"] = pd.to_datetime(df_news["published_at"], errors="coerce")
+df_news = df_news.dropna(subset=["published_at","headline"]).head(int(max_rows))
 
 # ------------------------- Run for assets -------------------------
 split_date = pd.Timestamp("2024-01-01")
