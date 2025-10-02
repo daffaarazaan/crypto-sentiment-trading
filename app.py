@@ -62,9 +62,20 @@ def build_asset_pipeline(asset, sent_daily, start, end, split_date, thr, cost):
     if isinstance(px.columns, pd.MultiIndex):
         px.columns = ["_".join([str(x) for x in tup if x != ""]).strip() for tup in px.columns]
 
-    price_col = "Close" if "Close" in px.columns else ("Adj Close" if "Adj Close" in px.columns else None)
-    assert price_col is not None, f"No Close/Adj Close in {asset} data."
-    price = px[price_col].squeeze(); price.name = "price"
+    # Pick price column robustly
+    candidates = ["Close", "Adj Close", "close", "adjclose"]
+    price_col = None
+    for c in candidates:
+        if c in px.columns:
+         price_col = c
+         break
+
+    if price_col is None:
+        st.error(f"⚠️ Could not find a price column for {asset}. Got columns: {px.columns.tolist()}")
+        return pd.DataFrame(), {}, []  # graceful exit
+
+    price = px[price_col].squeeze()
+    price.name = "price"
 
     # 2) Features
     px["ret"]   = price.pct_change()
@@ -283,7 +294,14 @@ split_date = pd.Timestamp("2024-01-01")
 all_metrics = []
 for asset in assets:
     st.subheader(f"Results for {asset}")
+    
     metrics, curves, dates = build_asset_pipeline(asset, sent_daily, start, end, split_date, thr, cost)
+    
+    # Guard: skip if no price data
+    if metrics.empty:
+        st.warning(f"No price data available for {asset}, skipping.")
+        continue
+
     st.dataframe(metrics, use_container_width=True)
 
     fig, ax = plt.subplots(figsize=(8,4))
@@ -296,8 +314,3 @@ for asset in assets:
 
     metrics["Asset"] = asset
     all_metrics.append(metrics)
-
-if all_metrics:
-    df_all = pd.concat(all_metrics, ignore_index=True)
-    st.subheader("Combined BTC & ETH Metrics")
-    st.dataframe(df_all, use_container_width=True)
