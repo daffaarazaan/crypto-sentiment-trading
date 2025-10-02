@@ -163,36 +163,119 @@ def score_sentiment(df_news, clf, batch=64):
     sent_daily = df_news.groupby("date")["sent"].agg(sent_mean="mean", sent_std="std", sent_n="count").reset_index()
     return sent_daily
 
-# ------------------------- Load News -------------------------
+# ------------------------- Load News + Build sent_daily -------------------------
+
+import glob, os
+
 def pick_col(cols, candidates):
-    """Helper: find the first matching column name from a list of candidates"""
     cols_low = [c.lower() for c in cols]
     for c in candidates:
         if c.lower() in cols_low:
             return cols[cols_low.index(c.lower())]
     return None
 
-uploaded = st.file_uploader("Upload a news CSV with a datetime + headline column (optional).")
-if uploaded:
-    df_news = pd.read_csv(uploaded)
+@st.cache_resource(show_spinner=False)
+def load_sentiment_model(model_name: str):
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    tok = AutoTokenizer.from_pretrained(model_name)
+    mdl = AutoModelForSequenceClassification.from_pretrained(model_name)
+    return pipeline("text-classification", model=mdl, tokenizer=tok, truncation=True)
+
+def score_sentiment(df_news: pd.DataFrame, clf, model_name: str, batch: int = 64) -> pd.DataFrame:
+    """Returns a daily dataframe with columns: date, sent_mean, sent_std, sent_n"""
+    if df_news.empty:
+        return pd.DataFrame(columns=["date", "sent_mean", "sent_std", "sent_n"])
+
+    # Handle different label sets across models
+    label_map_finbert = {"positive": 1, "negative": -1, "neutral": 0}
+    # CardiffNLP twitter-roberta-base-sentiment: LABEL_0=neg, LABEL_1=neu, LABEL_2=pos
+    label_map_cardiff = {"LABEL_0": -1, "LABEL_1": 0, "LABEL_2": 1}
+
+    scores = []
+    texts = df_news["headline"].astype(str).tolist()
+    for i in range(0, len(texts), batch):
+        outs = clf(texts[i:i+batch])
+        for o in outs:
+            lbl = str(o["label"])
+            if lbl.lower() in label_map_finbert:
+                scores.append(label_map_finbert[lbl.lower()])
+            elif lbl.upper() in label_map_cardiff:
+                scores.append(label_map_cardiff[lbl.upper()])
+            else:
+                # fallback: treat unknown labels as neutral
+                scores.append(0)
+
+    news = df_news.copy()
+    news["sent"] = scores
+    # Normalize to midnight (works for Series via .dt)
+    news["date"] = pd.to_datetime(news["published_at"], utc=True, errors="coerce").dt.tz_convert(None).dt.normalize()
+    news = news.dropna(subset=["date"])
+
+    sent_daily = (news.groupby("date")["sent"]
+                    .agg(sent_mean="mean", sent_std="std", sent_n="count")
+                    .reset_index())
+    return sent_daily
+
+# ---- UI: upload or Kaggle fallback ----
+uploaded = st.file_uploader(
+    "Upload a news CSV (we'll auto-detect datetime + headline columns). Optional if you use the Kaggle fallback.",
+    type=["csv"]
+)
+
+df_news = pd.DataFrame(columns=["published_at","headline"])
+
+if uploaded is not None:
+    tmp = pd.read_csv(uploaded)
+    cdate = pick_col(tmp.columns.tolist(), ["published_at","date","datetime","time","created_at","timestamp","pub_date"])
+    ctext = pick_col(tmp.columns.tolist(), ["headline","title","text","news","content","summary"])
+    if cdate and ctext:
+        df_news = tmp[[cdate, ctext]].rename(columns={cdate:"published_at", ctext:"headline"})
+    else:
+        st.error("Could not find datetime + headline/text columns in the uploaded file.")
 else:
-    import kagglehub, glob, os
-    path = kagglehub.dataset_download("oliviervha/crypto-news")
-    csvs = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
-    df_news = pd.read_csv(csvs[0])
+    # Kaggle fallback (oliviervha/crypto-news) — scan multiple CSVs and stitch
+    try:
+        import kagglehub
+        path = kagglehub.dataset_download("oliviervha/crypto-news")
+        csvs = glob.glob(os.path.join(path, "**", "*.csv"), recursive=True)
+        frames = []
+        for f in csvs:
+            try:
+                df_raw = pd.read_csv(f)
+                cdate = pick_col(df_raw.columns.tolist(), ["published_at","date","datetime","time","created_at","timestamp","pub_date"])
+                ctext = pick_col(df_raw.columns.tolist(), ["headline","title","text","news","content","summary"])
+                if cdate and ctext:
+                    part = df_raw[[cdate, ctext]].rename(columns={cdate:"published_at", ctext:"headline"})
+                    frames.append(part)
+            except Exception:
+                pass
+        if frames:
+            df_news = pd.concat(frames, ignore_index=True)
+        else:
+            st.warning("Kaggle dataset found but no suitable CSV columns detected.")
+    except Exception as e:
+        st.warning(f"Kaggle fallback failed: {e}")
 
-# Try to detect date and headline columns
-cdate = pick_col(df_news.columns.tolist(), ["published_at","date","datetime","time","created_at","timestamp","pub_date"])
-ctext = pick_col(df_news.columns.tolist(), ["headline","title","text","news","content","summary"])
+# Clean + limit rows for speed
+if not df_news.empty:
+    df_news["published_at"] = pd.to_datetime(df_news["published_at"], errors="coerce")
+    df_news = df_news.dropna(subset=["published_at","headline"])
+    df_news = df_news.sort_values("published_at").head(int(max_rows))
 
-if not cdate or not ctext:
-    st.error("Could not find a valid datetime and headline/text column in the news dataset.")
-    st.stop()
+st.write(f"Loaded news rows: **{len(df_news):,}**")
 
-# Rename for consistency
-df_news = df_news[[cdate, ctext]].rename(columns={cdate:"published_at", ctext:"headline"})
-df_news["published_at"] = pd.to_datetime(df_news["published_at"], errors="coerce")
-df_news = df_news.dropna(subset=["published_at","headline"]).head(int(max_rows))
+# Build sent_daily (ALWAYS define it)
+try:
+    from transformers import __version__ as _hf_ver  # ensure transformers installed
+    clf = load_sentiment_model(model_name)
+    with st.spinner("Scoring sentiment… (first run downloads the model)"):
+        sent_daily = score_sentiment(df_news, clf, model_name=model_name)
+    st.write(f"Daily sentiment rows: **{len(sent_daily):,}**")
+except Exception as e:
+    st.warning(f"Sentiment scoring unavailable ({e}). Using zero sentiment as fallback.")
+    # Fallback: zero sentiment over date range so the app still runs
+    date_index = pd.date_range(start=start, end=end, freq="D")
+    sent_daily = pd.DataFrame({"date": date_index, "sent_mean": 0.0, "sent_std": 0.0, "sent_n": 0})
 
 # ------------------------- Run for assets -------------------------
 split_date = pd.Timestamp("2024-01-01")
